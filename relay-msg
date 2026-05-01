@@ -289,6 +289,45 @@ def _esc(s):
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
+# `mysql -N -B` doubles backslashes and replaces NUL/backspace/newline/tab/CR/Z
+# with their escape sequences in column output, so values containing those
+# characters survive being placed in a tab-separated row. We have to reverse
+# the encoding before consumers like json.loads see the field, otherwise a
+# stored "\"a\":1" comes back as "\\"a\\":1" and string parsing breaks.
+# SQLite's CLI does not apply the same encoding, so this only runs on mysql.
+_MYSQL_BATCH_UNESCAPES = {
+    "0": "\0",
+    "b": "\b",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "Z": "\x1a",
+    "\\": "\\",
+}
+
+
+def _decode_mysql_field(s):
+    """Reverse `mysql -N -B` output escapes in a single field. Unknown
+    escape pairs (e.g. \\x for any x not in the table above) pass through
+    unchanged so we never silently corrupt data."""
+    if "\\" not in s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt in _MYSQL_BATCH_UNESCAPES:
+                out.append(_MYSQL_BATCH_UNESCAPES[nxt])
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 _MYSQL_SCHEMA = [
     """CREATE TABLE IF NOT EXISTS relay_agents (
         name VARCHAR(40) PRIMARY KEY,
@@ -767,6 +806,7 @@ def cmd_check(peek=False, history=False):
             print("No message history.")
         return
 
+    decode = _decode_mysql_field if not _is_sqlite() else (lambda s: s)
     ids = []
     for line in lines:
         parts = line.split("\t", 9)
@@ -775,12 +815,12 @@ def cmd_check(peek=False, history=False):
         ids.append(parts[0])
         sender = parts[1]
         ts = parts[2][:19].replace("T", " ")
-        message = parts[3]
+        message = decode(parts[3])
         read_at = parts[4] if len(parts) > 4 else "NULL"
         msg_type = parts[5] if len(parts) > 5 else "note"
-        payload = parts[6] if len(parts) > 6 else "NULL"
+        payload = decode(parts[6]) if len(parts) > 6 else "NULL"
         ref_type = parts[7] if len(parts) > 7 else "NULL"
-        ref_id = parts[8] if len(parts) > 8 else "NULL"
+        ref_id = decode(parts[8]) if len(parts) > 8 else "NULL"
         thread_id = parts[9] if len(parts) > 9 else "NULL"
 
         read_marker = " [read]" if read_at and read_at != "NULL" else ""

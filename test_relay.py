@@ -3,6 +3,7 @@
 
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -529,6 +530,58 @@ class TestMain(unittest.TestCase):
                     transport="remote",
                     aliases=["al"],
                 )
+
+
+class TestDecodeMysqlField(unittest.TestCase):
+    """Reverse of `mysql -N -B`'s output escape encoding. Without this,
+    JSON payloads containing internal escape sequences (any string with
+    quotes inside, which is most JSON) come back from SELECT with doubled
+    backslashes and json.loads barfs."""
+
+    def test_plain_string_unchanged(self):
+        self.assertEqual(relay._decode_mysql_field("hello world"), "hello world")
+
+    def test_doubled_backslash_collapses(self):
+        # mysql -B encodes a single '\' as '\\' on output.
+        self.assertEqual(relay._decode_mysql_field("a\\\\b"), "a\\b")
+
+    def test_escaped_quote_in_json_round_trips(self):
+        # The exact failure mode dogfooding caught: payload contains \" as
+        # the JSON escape for a literal quote inside a string. mysql -B
+        # turns the \ into \\, giving us \\" which json.loads can't parse.
+        encoded = '{"a":"\\\\"b"}'  # what mysql -B outputs
+        decoded = relay._decode_mysql_field(encoded)
+        self.assertEqual(decoded, '{"a":"\\"b"}')
+        # And critically, json.loads now succeeds on the decoded form.
+        # Note: the JSON has an escaped-quote-then-literal-content shape,
+        # so we just check it parses without exception.
+        parsed = json.loads(decoded)
+        self.assertEqual(parsed["a"], '"b')
+
+    def test_tab_newline_cr_decoded(self):
+        self.assertEqual(relay._decode_mysql_field("a\\tb"), "a\tb")
+        self.assertEqual(relay._decode_mysql_field("a\\nb"), "a\nb")
+        self.assertEqual(relay._decode_mysql_field("a\\rb"), "a\rb")
+
+    def test_unknown_escape_passes_through(self):
+        # \q is not an escape mysql -B produces; we leave it alone rather
+        # than silently corrupting data.
+        self.assertEqual(relay._decode_mysql_field("a\\qb"), "a\\qb")
+
+    def test_trailing_backslash_passes_through(self):
+        # No char follows — emit the backslash as-is.
+        self.assertEqual(relay._decode_mysql_field("a\\"), "a\\")
+
+    def test_mysql_output_form_of_typed_payload(self):
+        """End-to-end shape of the bug Conor hit: take a real JSON payload,
+        apply the encoding mysql -B does on output, then verify our decoder
+        produces something json.loads can parse."""
+        original = {"action": "review_pr", "pr": 45, "saw": '"quoted"'}
+        original_json = json.dumps(original)
+        # Simulate mysql -B doubling backslashes on output.
+        mysql_encoded = original_json.replace("\\", "\\\\")
+        decoded = relay._decode_mysql_field(mysql_encoded)
+        self.assertEqual(json.loads(decoded), original)
 
 
 class TestRenderTypedBody(unittest.TestCase):
