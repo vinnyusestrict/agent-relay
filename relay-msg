@@ -3,13 +3,27 @@
 Agent Relay — Inter-agent messaging for AI coding agents.
 
 Usage:
-  relay-msg send <target> <message>    Send a message to an agent or group
+  relay-msg send <target> <message>    Send a free-form note (default)
+  relay-msg send <target> --type T --payload JSON [refs/thread]
+                                       Send a typed, structured message
   relay-msg check                      Check for unread messages (marks as read)
   relay-msg check --peek               Check unread without marking as read
   relay-msg check --history            Show all messages including already-read
   relay-msg register <name> [options]  Register this agent
   relay-msg unregister <name>          Remove an agent
   relay-msg list                       List registered agents and groups
+
+Options for send:
+  --type <T>           Message type: note (default), task, result, query, ack,
+                       error, handoff. Typed messages require --payload and
+                       carry no prose body — the receiver renders a one-line
+                       summary from the JSON for free (no LLM tokens).
+  --payload <JSON>     Structured payload for typed messages (required when
+                       --type != note).
+  --ref-type <T>       Pointer type — e.g. issue, pr, file, analysis.
+  --ref-id <ID>        Pointer id — paired with --ref-type.
+  --thread-id <ID>     Collaboration scope id (free-form string).
+  --parent-id <N>      id of the message this one replies to.
 
 Options for register:
   --group <name>       Add agent to a group (repeatable)
@@ -33,6 +47,7 @@ Configuration via .relay-env file (gitignored) or environment variables:
   RELAY_TRANSPORT    "local" or "remote" (default: local)     [mysql only]
   RELAY_PROXY_CMD    Command to proxy MySQL for remote agents (optional, mysql only)
 """
+import json
 import sys
 import os
 import subprocess
@@ -297,10 +312,19 @@ _MYSQL_SCHEMA = [
         target VARCHAR(40) NOT NULL,
         sender VARCHAR(40) NOT NULL,
         message TEXT NOT NULL,
+        msg_type ENUM('note','task','result','query','ack','error','handoff')
+                 NOT NULL DEFAULT 'note',
+        payload JSON DEFAULT NULL,
+        ref_type VARCHAR(32) DEFAULT NULL,
+        ref_id VARCHAR(255) DEFAULT NULL,
+        thread_id VARCHAR(64) DEFAULT NULL,
+        parent_id INT DEFAULT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         read_at TIMESTAMP NULL DEFAULT NULL,
         KEY idx_target (target),
-        KEY idx_read_at (read_at)
+        KEY idx_read_at (read_at),
+        KEY idx_thread (thread_id),
+        KEY idx_parent (parent_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 ]
 
@@ -329,16 +353,92 @@ _SQLITE_SCHEMA = [
         target TEXT NOT NULL,
         sender TEXT NOT NULL,
         message TEXT NOT NULL,
+        msg_type TEXT NOT NULL DEFAULT 'note'
+                 CHECK (msg_type IN ('note','task','result','query','ack','error','handoff')),
+        payload TEXT DEFAULT NULL,
+        ref_type TEXT DEFAULT NULL,
+        ref_id TEXT DEFAULT NULL,
+        thread_id TEXT DEFAULT NULL,
+        parent_id INTEGER DEFAULT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         read_at TEXT DEFAULT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_target ON relay_messages (target)",
     "CREATE INDEX IF NOT EXISTS idx_read_at ON relay_messages (read_at)",
+    "CREATE INDEX IF NOT EXISTS idx_thread ON relay_messages (thread_id)",
+    "CREATE INDEX IF NOT EXISTS idx_parent ON relay_messages (parent_id)",
 ]
 
 
+ALLOWED_MSG_TYPES = ("note", "task", "result", "query", "ack", "error", "handoff")
+
+# Columns added in the typed-messages migration. Names must match the
+# CREATE TABLE definitions above so a fresh install never triggers an ALTER.
+_NEW_MESSAGE_COLUMNS_MYSQL = [
+    ("msg_type",  "ENUM('note','task','result','query','ack','error','handoff') "
+                  "NOT NULL DEFAULT 'note'"),
+    ("payload",   "JSON DEFAULT NULL"),
+    ("ref_type",  "VARCHAR(32) DEFAULT NULL"),
+    ("ref_id",    "VARCHAR(255) DEFAULT NULL"),
+    ("thread_id", "VARCHAR(64) DEFAULT NULL"),
+    ("parent_id", "INT DEFAULT NULL"),
+]
+# SQLite ALTER TABLE ADD COLUMN forbids inline CHECK on an enum-style column
+# in some older builds; we drop the constraint here and rely on app-level
+# validation (ALLOWED_MSG_TYPES) to keep parity with the MySQL ENUM.
+_NEW_MESSAGE_COLUMNS_SQLITE = [
+    ("msg_type",  "TEXT NOT NULL DEFAULT 'note'"),
+    ("payload",   "TEXT DEFAULT NULL"),
+    ("ref_type",  "TEXT DEFAULT NULL"),
+    ("ref_id",    "TEXT DEFAULT NULL"),
+    ("thread_id", "TEXT DEFAULT NULL"),
+    ("parent_id", "INTEGER DEFAULT NULL"),
+]
+
+
+def _existing_message_columns():
+    """Return the set of column names currently on relay_messages, or
+    an empty set if the table doesn't exist / DB is unreachable."""
+    if _is_sqlite():
+        rows = run_sql_raw("PRAGMA table_info(relay_messages)", fetch=True)
+        cols = set()
+        for r in rows:
+            parts = r.split("\t")
+            if len(parts) >= 2:
+                cols.add(parts[1])
+        return cols
+    rows = run_sql_raw(
+        f"SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        f"WHERE TABLE_SCHEMA = '{_esc(DB_NAME)}' "
+        f"AND TABLE_NAME = 'relay_messages'",
+        fetch=True,
+    )
+    return {r.strip() for r in rows if r.strip()}
+
+
+def _migrate_messages_table():
+    """Add typed-message columns + indexes to an existing relay_messages.
+    No-ops on fresh installs (CREATE TABLE already includes them) and on
+    any DB error."""
+    try:
+        existing = _existing_message_columns()
+    except Exception:
+        return
+    if not existing:
+        return  # table not present → CREATE TABLE has handled it
+    cols = _NEW_MESSAGE_COLUMNS_SQLITE if _is_sqlite() else _NEW_MESSAGE_COLUMNS_MYSQL
+    for name, dtype in cols:
+        if name not in existing:
+            run_sql_raw(f"ALTER TABLE relay_messages ADD COLUMN {name} {dtype}")
+    # Indexes — both backends accept CREATE INDEX IF NOT EXISTS on MariaDB
+    # 10.5+ and SQLite. On legacy MySQL the call fails silently (run_sql_raw
+    # swallows non-zero exit codes) and the index simply isn't created.
+    run_sql_raw("CREATE INDEX IF NOT EXISTS idx_thread ON relay_messages (thread_id)")
+    run_sql_raw("CREATE INDEX IF NOT EXISTS idx_parent ON relay_messages (parent_id)")
+
+
 def ensure_schema():
-    """Idempotent: create tables if they don't exist."""
+    """Idempotent: create tables if they don't exist, then migrate columns."""
     global _schema_checked
     if _schema_checked:
         return
@@ -347,6 +447,7 @@ def ensure_schema():
     try:
         for s in stmts:
             run_sql_raw(s)
+        _migrate_messages_table()
     except SystemExit:
         pass
 
@@ -480,10 +581,51 @@ def _get_aliases(agent_name):
     return [r.strip() for r in rows if r.strip()]
 
 
-def cmd_send(target, message):
-    """Send a message to an agent or group."""
+def cmd_send(target, message, msg_type="note", payload=None, ref_type=None,
+             ref_id=None, thread_id=None, parent_id=None):
+    """Send a message to an agent or group.
+
+    Two shapes:
+      - note (default): free-form `message` text, no `payload`.
+      - typed (task/result/query/ack/error/handoff): structured `payload`
+        JSON, no `message` text. The receiver renders a one-line summary
+        from the payload at display time, so the sender pays output tokens
+        for the JSON only — not for prose that restates it.
+    """
     ensure_schema()
     me = detect_self()
+
+    if msg_type not in ALLOWED_MSG_TYPES:
+        print(f"Invalid --type {msg_type!r}. Allowed: {', '.join(ALLOWED_MSG_TYPES)}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if payload is not None:
+        try:
+            json.loads(payload)
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"Invalid JSON in --payload: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if msg_type == "note":
+        if not message:
+            print("Note messages require a text body.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not payload:
+            print(f"--type {msg_type} requires --payload '{{...}}' (JSON).",
+                  file=sys.stderr)
+            sys.exit(1)
+        # Drop prose for typed sends — the JSON is the message.
+        message = ""
+
+    if parent_id is not None:
+        try:
+            parent_id = int(parent_id)
+        except (TypeError, ValueError):
+            print(f"--parent-id must be an integer, got: {parent_id!r}",
+                  file=sys.stderr)
+            sys.exit(1)
 
     all_agents = _get_all_agents()
     all_groups = _get_all_groups()
@@ -494,21 +636,45 @@ def cmd_send(target, message):
         if not recipients:
             print("No other agents registered.", file=sys.stderr)
             sys.exit(1)
-        message = f"[broadcast] {message}"
+        if msg_type == "note":
+            message = f"[broadcast] {message}"
     elif target in all_groups:
         recipients = [a for a in _get_group_members(target) if a != me]
         if not recipients:
             print(f"No peers in '{target}' group besides yourself.", file=sys.stderr)
             sys.exit(1)
-        message = f"[broadcast:{target}] {message}"
+        if msg_type == "note":
+            message = f"[broadcast:{target}] {message}"
     else:
         # Resolve alias to real agent name.
         resolved = _resolve_alias(target)
         recipients = [resolved]
 
-    safe_msg = _esc(message)
-    values = ", ".join(f"('{_esc(r)}', '{_esc(me)}', '{safe_msg}')" for r in recipients)
-    run_sql(f"INSERT INTO relay_messages (target, sender, message) VALUES {values}")
+    # Build INSERT column list dynamically — we only emit the typed columns
+    # when they're set, so on a pre-migration DB the INSERT still works for
+    # plain notes.
+    cols = ["target", "sender", "message", "msg_type"]
+    base_vals = [None, f"'{_esc(me)}'", f"'{_esc(message)}'", f"'{_esc(msg_type)}'"]
+    if payload is not None:
+        cols.append("payload"); base_vals.append(f"'{_esc(payload)}'")
+    if ref_type:
+        cols.append("ref_type"); base_vals.append(f"'{_esc(ref_type)}'")
+    if ref_id:
+        cols.append("ref_id"); base_vals.append(f"'{_esc(ref_id)}'")
+    if thread_id:
+        cols.append("thread_id"); base_vals.append(f"'{_esc(thread_id)}'")
+    if parent_id is not None:
+        cols.append("parent_id"); base_vals.append(str(parent_id))
+
+    rows = []
+    for r in recipients:
+        row = list(base_vals)
+        row[0] = f"'{_esc(r)}'"
+        rows.append(f"({', '.join(row)})")
+
+    run_sql(
+        f"INSERT INTO relay_messages ({', '.join(cols)}) VALUES {', '.join(rows)}"
+    )
 
     _nudge_recipients(recipients)
 
@@ -545,6 +711,33 @@ def _nudge_recipients(recipients):
             pass
 
 
+def _render_typed_body(msg_type, payload_str, ref_type, ref_id, thread_id):
+    """Build a one-line summary for a typed message from its JSON payload.
+    No LLM involved — this is templated text the receiver gets for free."""
+    label = msg_type
+    if ref_type and ref_type != "NULL" and ref_id and ref_id != "NULL":
+        label = f"{label}\u2192{ref_type}:{ref_id}"
+    head = f"[{label}]"
+    if thread_id and thread_id != "NULL":
+        head += f" #{thread_id}"
+
+    if not payload_str or payload_str == "NULL":
+        return head
+    try:
+        data = json.loads(payload_str)
+    except (json.JSONDecodeError, TypeError):
+        return f"{head} {payload_str}"
+
+    if isinstance(data, dict):
+        pairs = []
+        for k, v in data.items():
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, separators=(",", ":"))
+            pairs.append(f"{k}={v}")
+        return f"{head} {' '.join(pairs)}" if pairs else head
+    return f"{head} {payload_str}"
+
+
 def cmd_check(peek=False, history=False):
     """Check for messages."""
     ensure_schema()
@@ -563,7 +756,8 @@ def cmd_check(peek=False, history=False):
         where = f"{targets_clause} AND read_at IS NULL"
 
     lines = run_sql(
-        f"SELECT id, sender, created_at, message, read_at "
+        f"SELECT id, sender, created_at, message, read_at, "
+        f"msg_type, payload, ref_type, ref_id, thread_id "
         f"FROM relay_messages WHERE {where} ORDER BY created_at",
         fetch=True,
     )
@@ -575,12 +769,26 @@ def cmd_check(peek=False, history=False):
 
     ids = []
     for line in lines:
-        parts = line.split("\t", 4)
-        if len(parts) >= 4:
-            ids.append(parts[0])
-            ts = parts[2][:19].replace("T", " ")
-            read_marker = " [read]" if len(parts) > 4 and parts[4] != "NULL" else ""
-            print(f"[{parts[1]}] ({ts}){read_marker} {parts[3]}")
+        parts = line.split("\t", 9)
+        if len(parts) < 4:
+            continue
+        ids.append(parts[0])
+        sender = parts[1]
+        ts = parts[2][:19].replace("T", " ")
+        message = parts[3]
+        read_at = parts[4] if len(parts) > 4 else "NULL"
+        msg_type = parts[5] if len(parts) > 5 else "note"
+        payload = parts[6] if len(parts) > 6 else "NULL"
+        ref_type = parts[7] if len(parts) > 7 else "NULL"
+        ref_id = parts[8] if len(parts) > 8 else "NULL"
+        thread_id = parts[9] if len(parts) > 9 else "NULL"
+
+        read_marker = " [read]" if read_at and read_at != "NULL" else ""
+        if msg_type and msg_type != "note" and msg_type != "NULL":
+            body = _render_typed_body(msg_type, payload, ref_type, ref_id, thread_id)
+        else:
+            body = message
+        print(f"[{sender}] ({ts}){read_marker} {body}")
 
     # Mark unread as read (unless peeking or viewing history).
     if not peek and not history and ids:
@@ -600,9 +808,49 @@ def main():
 
     if cmd == "send":
         if len(sys.argv) < 4:
-            print("Usage: relay-msg send <target> <message>", file=sys.stderr)
+            print(
+                "Usage: relay-msg send <target> [<message>] "
+                "[--type T] [--payload JSON] [--ref-type T] [--ref-id ID] "
+                "[--thread-id ID] [--parent-id N]",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        cmd_send(sys.argv[2], " ".join(sys.argv[3:]))
+        target = sys.argv[2]
+        msg_type = "note"
+        payload = None
+        ref_type = None
+        ref_id = None
+        thread_id = None
+        parent_id = None
+        message_parts = []
+        i = 3
+        flag_args = {
+            "--type": "msg_type",
+            "--payload": "payload",
+            "--ref-type": "ref_type",
+            "--ref-id": "ref_id",
+            "--thread-id": "thread_id",
+            "--parent-id": "parent_id",
+        }
+        flag_values = {}
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg in flag_args and i + 1 < len(sys.argv):
+                flag_values[flag_args[arg]] = sys.argv[i + 1]
+                i += 2
+            else:
+                message_parts.append(arg)
+                i += 1
+        msg_type = flag_values.get("msg_type", "note")
+        payload = flag_values.get("payload")
+        ref_type = flag_values.get("ref_type")
+        ref_id = flag_values.get("ref_id")
+        thread_id = flag_values.get("thread_id")
+        parent_id = flag_values.get("parent_id")
+        message = " ".join(message_parts)
+        cmd_send(target, message, msg_type=msg_type, payload=payload,
+                 ref_type=ref_type, ref_id=ref_id, thread_id=thread_id,
+                 parent_id=parent_id)
 
     elif cmd == "check":
         peek = "--peek" in sys.argv

@@ -531,5 +531,234 @@ class TestMain(unittest.TestCase):
                 )
 
 
+class TestRenderTypedBody(unittest.TestCase):
+    """Display-time rendering of typed-message JSON to one-line text.
+    No LLM is involved — this is the cost-saving substitute for prose."""
+
+    def test_simple_payload(self):
+        out = relay._render_typed_body(
+            "task", '{"action":"review_pr","pr":45}', "pr", "45", None,
+        )
+        self.assertIn("[task\u2192pr:45]", out)
+        self.assertIn("action=review_pr", out)
+        self.assertIn("pr=45", out)
+
+    def test_thread_id_appended(self):
+        out = relay._render_typed_body(
+            "task", '{"a":1}', None, None, "review-45",
+        )
+        self.assertIn("[task]", out)
+        self.assertIn("#review-45", out)
+
+    def test_null_payload_renders_label_only(self):
+        out = relay._render_typed_body("ack", "NULL", None, None, None)
+        self.assertEqual(out, "[ack]")
+
+    def test_null_ref_fields_omitted(self):
+        out = relay._render_typed_body(
+            "result", '{"status":"ok"}', "NULL", "NULL", "NULL",
+        )
+        self.assertNotIn("\u2192", out)
+        self.assertNotIn("#", out)
+        self.assertIn("status=ok", out)
+
+    def test_invalid_json_falls_back_to_raw(self):
+        out = relay._render_typed_body("task", "not-json", None, None, None)
+        self.assertIn("[task]", out)
+        self.assertIn("not-json", out)
+
+    def test_nested_values_serialized(self):
+        out = relay._render_typed_body(
+            "task", '{"params":{"k":1},"items":[1,2]}', None, None, None,
+        )
+        self.assertIn('params={"k":1}', out)
+        self.assertIn("items=[1,2]", out)
+
+
+class TestCmdSendTyped(unittest.TestCase):
+    """Validation and SQL shape for typed sends."""
+
+    def setUp(self):
+        # Each patch is started here and stopped via addCleanup so the
+        # exact same patcher instance is unwound — re-creating patchers
+        # in a teardown helper would leak the started ones into later tests.
+        patchers = [
+            patch("relay_msg.ensure_schema"),
+            patch("relay_msg.detect_self", return_value="alice"),
+            patch("relay_msg._get_all_agents", return_value=["alice", "bob"]),
+            patch("relay_msg._get_all_groups", return_value=[]),
+            patch("relay_msg._resolve_alias", return_value="bob"),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_invalid_msg_type_exits(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                relay.cmd_send("bob", "x", msg_type="bogus")
+
+    def test_typed_without_payload_exits(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                relay.cmd_send("bob", "", msg_type="task")
+
+    def test_invalid_json_payload_exits(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                relay.cmd_send("bob", "", msg_type="task", payload="not-json")
+
+    def test_note_without_message_exits(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                relay.cmd_send("bob", "", msg_type="note")
+
+    def test_typed_send_drops_message_text(self):
+        """Typed sends must not store prose alongside JSON — that would
+        double the sender's output tokens."""
+        with patch("relay_msg.run_sql") as mock_sql:
+            with patch("sys.stdout", new_callable=StringIO):
+                relay.cmd_send(
+                    "bob", "this prose should be dropped",
+                    msg_type="task",
+                    payload='{"action":"x"}',
+                )
+                sql = mock_sql.call_args[0][0]
+                self.assertNotIn("this prose should be dropped", sql)
+                self.assertIn("'task'", sql)
+                self.assertIn('{"action":"x"}', sql)
+
+    def test_typed_send_includes_refs_and_thread(self):
+        with patch("relay_msg.run_sql") as mock_sql:
+            with patch("sys.stdout", new_callable=StringIO):
+                relay.cmd_send(
+                    "bob", "",
+                    msg_type="task",
+                    payload='{"action":"x"}',
+                    ref_type="pr",
+                    ref_id="45",
+                    thread_id="review-45",
+                )
+                sql = mock_sql.call_args[0][0]
+                self.assertIn("'pr'", sql)
+                self.assertIn("'45'", sql)
+                self.assertIn("'review-45'", sql)
+
+    def test_broadcast_prefix_skipped_for_typed(self):
+        """[broadcast:group] prose only attaches to note sends — typed
+        messages already convey routing via target + thread_id."""
+        with patch("relay_msg.ensure_schema"), \
+             patch("relay_msg.detect_self", return_value="alice"), \
+             patch("relay_msg._get_all_agents", return_value=["alice", "bob"]), \
+             patch("relay_msg._get_all_groups", return_value=["dev"]), \
+             patch("relay_msg._get_group_members", return_value=["alice", "bob"]), \
+             patch("relay_msg.run_sql") as mock_sql, \
+             patch("sys.stdout", new_callable=StringIO):
+            relay.cmd_send("dev", "", msg_type="task", payload='{"a":1}')
+            sql = mock_sql.call_args[0][0]
+            self.assertNotIn("[broadcast", sql)
+
+
+class TestMigration(unittest.TestCase):
+    """Schema migration helpers."""
+
+    def test_existing_columns_sqlite_parses_pragma(self):
+        with patch("relay_msg._is_sqlite", return_value=True):
+            with patch("relay_msg.run_sql_raw", return_value=[
+                "0\tid\tINTEGER\t0\t\t1",
+                "1\ttarget\tTEXT\t1\t\t0",
+                "2\tmessage\tTEXT\t1\t\t0",
+            ]):
+                cols = relay._existing_message_columns()
+                self.assertEqual(cols, {"id", "target", "message"})
+
+    def test_existing_columns_mysql_parses_information_schema(self):
+        with patch("relay_msg._is_sqlite", return_value=False):
+            with patch("relay_msg.run_sql_raw", return_value=[
+                "id", "target", "sender", "message",
+            ]):
+                cols = relay._existing_message_columns()
+                self.assertEqual(cols, {"id", "target", "sender", "message"})
+
+    def test_migrate_skips_when_table_missing(self):
+        """If introspection returns empty, CREATE TABLE has handled it —
+        no ALTER calls."""
+        with patch("relay_msg._existing_message_columns", return_value=set()):
+            with patch("relay_msg.run_sql_raw") as mock_raw:
+                relay._migrate_messages_table()
+                mock_raw.assert_not_called()
+
+    def test_migrate_adds_only_missing_columns(self):
+        existing = {"id", "target", "sender", "message", "created_at", "read_at"}
+        with patch("relay_msg._is_sqlite", return_value=True):
+            with patch("relay_msg._existing_message_columns", return_value=existing):
+                with patch("relay_msg.run_sql_raw") as mock_raw:
+                    relay._migrate_messages_table()
+                    altered = [
+                        c for c in mock_raw.call_args_list
+                        if c.args and "ALTER TABLE" in c.args[0]
+                    ]
+                    self.assertEqual(len(altered), 6)  # six new columns
+                    sqls = " ".join(c.args[0] for c in altered)
+                    for col in ("msg_type", "payload", "ref_type",
+                                "ref_id", "thread_id", "parent_id"):
+                        self.assertIn(col, sqls)
+
+    def test_migrate_no_alters_when_all_present(self):
+        existing = {
+            "id", "target", "sender", "message", "created_at", "read_at",
+            "msg_type", "payload", "ref_type", "ref_id", "thread_id", "parent_id",
+        }
+        with patch("relay_msg._is_sqlite", return_value=True):
+            with patch("relay_msg._existing_message_columns", return_value=existing):
+                with patch("relay_msg.run_sql_raw") as mock_raw:
+                    relay._migrate_messages_table()
+                    altered = [
+                        c for c in mock_raw.call_args_list
+                        if c.args and "ALTER TABLE" in c.args[0]
+                    ]
+                    self.assertEqual(altered, [])
+
+
+class TestMainSendFlags(unittest.TestCase):
+    """CLI parsing of typed-message flags."""
+
+    def test_send_with_type_and_payload(self):
+        with patch("sys.argv", [
+            "relay-msg", "send", "bob",
+            "--type", "task",
+            "--payload", '{"action":"x"}',
+            "--ref-type", "pr",
+            "--ref-id", "45",
+            "--thread-id", "review-45",
+            "--parent-id", "12",
+        ]):
+            with patch("relay_msg.cmd_send") as mock_send:
+                relay.main()
+                mock_send.assert_called_once_with(
+                    "bob", "",
+                    msg_type="task",
+                    payload='{"action":"x"}',
+                    ref_type="pr",
+                    ref_id="45",
+                    thread_id="review-45",
+                    parent_id="12",
+                )
+
+    def test_send_default_note_with_positional_message(self):
+        with patch("sys.argv", ["relay-msg", "send", "bob", "hello", "world"]):
+            with patch("relay_msg.cmd_send") as mock_send:
+                relay.main()
+                mock_send.assert_called_once_with(
+                    "bob", "hello world",
+                    msg_type="note",
+                    payload=None,
+                    ref_type=None,
+                    ref_id=None,
+                    thread_id=None,
+                    parent_id=None,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
