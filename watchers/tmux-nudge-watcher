@@ -50,7 +50,9 @@ nudge_agent() {
         return 0
     fi
     log "nudging $agent ($target): $message"
-    tmux send-keys -t "$target" "$message" Enter 2>/dev/null ||
+    # C-u clears any leftover text on the input line — prevents concatenation
+    # when a previous nudge's keystrokes haven't been submitted yet.
+    tmux send-keys -t "$target" C-u "$message" Enter 2>/dev/null ||
         log "WARN: send-keys to '$target' failed"
 }
 

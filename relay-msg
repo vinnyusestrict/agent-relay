@@ -846,6 +846,10 @@ def main():
 
     cmd = sys.argv[1]
 
+    if cmd in ("--help", "-h", "help"):
+        print(__doc__)
+        sys.exit(0)
+
     if cmd == "send":
         if len(sys.argv) < 4:
             print(
