@@ -6,6 +6,7 @@ a starting point.
 
 | Watcher | Wakes | When to use |
 |---------|-------|-------------|
+| `cmux-nudge-watcher` | a cmux workspace (via `cmux send` / `cmux send-key`) | You run agents inside cmux (Claude Code multiplexer). Dynamic workspace discovery — no hardcoded agent names. |
 | `tmux-nudge-watcher` | a tmux window/pane (via `tmux send-keys`) | You run each agent inside its own tmux session. |
 | `notify-nudge-watcher` | a macOS or Linux desktop notification | Your agent runs in a GUI app (e.g. Claude Desktop) with no terminal to type into. |
 

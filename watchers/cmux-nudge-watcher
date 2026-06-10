@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# cmux-nudge-watcher — wakes cmux workspaces on relay nudge.
+#
+# Flag-file contract: ./<WATCH_DIR>/.nudge-<agent>, contents = keystrokes to
+# inject (default: "check inbox"). See the Agent Relay README "Wake-up nudges"
+# section.
+#
+# How this watcher maps `<agent>` to a cmux target:
+#   Discovers all cmux workspaces dynamically via `cmux tree --all`, then
+#   matches the agent name (case-insensitive) to workspace titles.
+#   Re-discovers on miss so new sessions are picked up without a restart.
+#
+# Usage:
+#   ./cmux-nudge-watcher [WATCH_DIR]
+#
+# WATCH_DIR defaults to the parent of this script's directory.
+
+set -uo pipefail
+
+WATCH_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+POLL_INTERVAL=3
+DEBOUNCE_SECONDS=2
+LOG_FILE="/tmp/cmux-nudge-watcher-$(basename "$WATCH_DIR").log"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+
+trap 'rc=$?; if [ $rc -ne 0 ] && [ $rc -ne 130 ] && [ $rc -ne 143 ]; then log "FATAL: watcher died (line $LINENO, exit $rc). Restarting in 5s..."; sleep 5; exec "$0" "$@"; fi' ERR
+
+# Workspace map stored as newline-delimited "name\tref" pairs (bash 3 compat)
+WS_MAP=""
+
+discover_workspaces() {
+    WS_MAP=""
+    while IFS=$'\t' read -r ref title; do
+        [ -z "$ref" ] && continue
+        local key
+        key="$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed 's/ *$//')"
+        WS_MAP="${WS_MAP}${key}	${ref}
+"
+    done < <(cmux tree --all 2>/dev/null \
+                 | grep -oE 'workspace workspace:[0-9]+ "[^"]+"' \
+                 | sed -E 's/^workspace (workspace:[0-9]+) "([^"]+)"$/\1\t\2/')
+
+    log "Workspace map:"
+    echo -n "$WS_MAP" | while IFS=$'\t' read -r k v; do
+        [ -n "$k" ] && log "  $k -> $v"
+    done
+}
+
+get_workspace_for() {
+    local key
+    key="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    echo -n "$WS_MAP" | while IFS=$'\t' read -r k v; do
+        if [ "$k" = "$key" ]; then
+            echo "$v"
+            return
+        fi
+    done
+}
+
+nudge_agent() {
+    local agent="$1"
+    local message="${2:-check inbox}"
+    local ws
+    ws="$(get_workspace_for "$agent")"
+
+    if [ -z "$ws" ]; then
+        log "No workspace for '$agent' — re-discovering..."
+        discover_workspaces
+        ws="$(get_workspace_for "$agent")"
+        if [ -z "$ws" ]; then
+            log "ERROR: still no workspace for '$agent', skipping"
+            return 0
+        fi
+    fi
+
+    log "Nudging $agent ($ws): $message"
+    cmux send --workspace "$ws" "$message" || { log "WARN: send to $agent timed out, skipping"; return 0; }
+    cmux send-key --workspace "$ws" enter || { log "WARN: send-key to $agent timed out"; return 0; }
+}
+
+# --- Main loop ---
+
+log "Starting in $WATCH_DIR (poll every ${POLL_INTERVAL}s)"
+log "Discovering cmux workspaces..."
+discover_workspaces
+
+while true; do
+    for flag in "$WATCH_DIR"/.nudge-*; do
+        [ -e "$flag" ] || continue
+
+        waited=0
+        while true; do
+            last_mtime=$(stat -f %m "$flag" 2>/dev/null || stat -c %Y "$flag" 2>/dev/null || echo 0)
+            sleep "$DEBOUNCE_SECONDS"
+            [ -e "$flag" ] || break 2
+            new_mtime=$(stat -f %m "$flag" 2>/dev/null || stat -c %Y "$flag" 2>/dev/null || echo 0)
+            if [ "$new_mtime" = "$last_mtime" ]; then
+                break
+            fi
+            waited=$((waited + DEBOUNCE_SECONDS))
+            if [ "$waited" -ge 30 ]; then
+                log "WARN: flag $flag kept rewriting for 30s — sending anyway"
+                break
+            fi
+        done
+
+        local_name="$(basename "$flag")"
+        agent="${local_name#.nudge-}"
+
+        message="$(cat "$flag" 2>/dev/null || true)"
+        message="${message:-check inbox}"
+
+        rm -f "$flag"
+
+        nudge_agent "$agent" "$message"
+    done
+
+    sleep "$POLL_INTERVAL"
+done
