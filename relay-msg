@@ -12,6 +12,7 @@ Usage:
   relay-msg register <name> [options]  Register this agent
   relay-msg unregister <name>          Remove an agent
   relay-msg list                       List registered agents and groups
+  relay-msg nudge <agent> [message]    Write a nudge flag file for an agent
 
 Options for send:
   --type <T>           Message type: note (default), task, result, query, ack,
@@ -30,6 +31,11 @@ Options for register:
   --cwd <pattern>      CWD pattern for auto-detection
   --transport local    How this agent connects to MySQL: "local" (direct) or "remote" (via proxy)
   --alias <name>       Alternate name this agent also receives messages for (repeatable)
+  --nudge-dir <path>   Directory where this agent's .nudge-<name> flag file should be written
+
+Options for nudge:
+  <agent>              Name of the agent to nudge
+  [message]            Optional message text (default: "check inbox")
 
 Agents self-register into a relay_agents table. No hardcoded peers.
 Groups are derived from agent registrations — no hardcoded broadcast lists.
@@ -333,6 +339,7 @@ _MYSQL_SCHEMA = [
         name VARCHAR(40) PRIMARY KEY,
         transport ENUM('local','remote') NOT NULL DEFAULT 'local',
         cwd_pattern VARCHAR(255) DEFAULT NULL,
+        nudge_dir VARCHAR(512) DEFAULT NULL,
         registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS relay_agent_groups (
@@ -376,6 +383,7 @@ _SQLITE_SCHEMA = [
         name TEXT PRIMARY KEY,
         transport TEXT NOT NULL DEFAULT 'local' CHECK (transport IN ('local','remote')),
         cwd_pattern TEXT DEFAULT NULL,
+        nudge_dir TEXT DEFAULT NULL,
         registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )""",
     """CREATE TABLE IF NOT EXISTS relay_agent_groups (
@@ -476,6 +484,30 @@ def _migrate_messages_table():
     run_sql_raw("CREATE INDEX IF NOT EXISTS idx_parent ON relay_messages (parent_id)")
 
 
+def _migrate_agents_table():
+    """Add nudge_dir column to relay_agents if it doesn't exist yet.
+    No-op on fresh installs (CREATE TABLE already includes it) and on
+    any DB error."""
+    try:
+        if _is_sqlite():
+            rows = run_sql_raw("PRAGMA table_info(relay_agents)", fetch=True)
+            cols = set()
+            for r in rows:
+                parts = r.split("\t")
+                if len(parts) >= 2:
+                    cols.add(parts[1])
+            if "nudge_dir" not in cols:
+                run_sql_raw("ALTER TABLE relay_agents ADD COLUMN nudge_dir TEXT DEFAULT NULL")
+        else:
+            # MariaDB supports IF NOT EXISTS on ALTER TABLE ADD COLUMN.
+            run_sql_raw(
+                "ALTER TABLE relay_agents ADD COLUMN IF NOT EXISTS "
+                "nudge_dir VARCHAR(512) NULL"
+            )
+    except Exception:
+        pass
+
+
 def ensure_schema():
     """Idempotent: create tables if they don't exist, then migrate columns."""
     global _schema_checked
@@ -487,6 +519,7 @@ def ensure_schema():
         for s in stmts:
             run_sql_raw(s)
         _migrate_messages_table()
+        _migrate_agents_table()
     except SystemExit:
         pass
 
@@ -503,15 +536,21 @@ def _upsert_clause(conflict_col, update_pairs):
     return f"ON DUPLICATE KEY UPDATE {sets}"
 
 
-def cmd_register(name, groups=None, cwd_pattern=None, transport="local", aliases=None):
+def cmd_register(name, groups=None, cwd_pattern=None, transport="local", aliases=None,
+                 nudge_dir=None):
     """Register an agent."""
     ensure_schema()
     safe_name = _esc(name)
     safe_cwd = f"'{_esc(cwd_pattern)}'" if cwd_pattern else "NULL"
-    upsert = _upsert_clause("name", [f"transport='{_esc(transport)}'", f"cwd_pattern={safe_cwd}"])
+    safe_nudge_dir = f"'{_esc(nudge_dir)}'" if nudge_dir else "NULL"
+    upsert = _upsert_clause("name", [
+        f"transport='{_esc(transport)}'",
+        f"cwd_pattern={safe_cwd}",
+        f"nudge_dir={safe_nudge_dir}",
+    ])
     run_sql(
-        f"INSERT INTO relay_agents (name, transport, cwd_pattern) "
-        f"VALUES ('{safe_name}', '{_esc(transport)}', {safe_cwd}) {upsert}"
+        f"INSERT INTO relay_agents (name, transport, cwd_pattern, nudge_dir) "
+        f"VALUES ('{safe_name}', '{_esc(transport)}', {safe_cwd}, {safe_nudge_dir}) {upsert}"
     )
     # Clear old groups and set new ones.
     run_sql(f"DELETE FROM relay_agent_groups WHERE agent_name = '{safe_name}'")
@@ -533,6 +572,8 @@ def cmd_register(name, groups=None, cwd_pattern=None, transport="local", aliases
         parts.append(f"groups: {', '.join(groups)}")
     if aliases:
         parts.append(f"aliases: {', '.join(aliases)}")
+    if nudge_dir:
+        parts.append(f"nudge_dir: {nudge_dir}")
     extra = f" ({'; '.join(parts)})" if parts else ""
     print(f"Registered: {name}{extra}")
 
@@ -557,7 +598,7 @@ def cmd_list():
         aliases_col = "GROUP_CONCAT(DISTINCT al.alias_name ORDER BY al.alias_name SEPARATOR ', ')"
     rows = run_sql(
         f"SELECT a.name, a.transport, a.cwd_pattern, "
-        f"{groups_col} AS groups, {aliases_col} AS aliases "
+        f"{groups_col} AS groups, {aliases_col} AS aliases, a.nudge_dir "
         "FROM relay_agents a "
         "LEFT JOIN relay_agent_groups g ON a.name = g.agent_name "
         "LEFT JOIN relay_agent_aliases al ON a.name = al.agent_name "
@@ -567,16 +608,17 @@ def cmd_list():
     if not rows:
         print("No agents registered.")
         return
-    print(f"{'Agent':<15} {'Transport':<10} {'Groups':<20} {'Aliases':<20} {'CWD Pattern'}")
-    print("-" * 85)
+    print(f"{'Agent':<15} {'Transport':<10} {'Groups':<20} {'Aliases':<20} {'CWD Pattern':<25} {'Nudge Dir'}")
+    print("-" * 105)
     for row in rows:
-        parts = row.split("\t", 4)
+        parts = row.split("\t", 5)
         name = parts[0] if len(parts) > 0 else ""
         transport = parts[1] if len(parts) > 1 else ""
         cwd = parts[2] if len(parts) > 2 and parts[2] != "NULL" else ""
         groups = parts[3] if len(parts) > 3 and parts[3] != "NULL" else ""
         aliases = parts[4] if len(parts) > 4 and parts[4] != "NULL" else ""
-        print(f"{name:<15} {transport:<10} {groups:<20} {aliases:<20} {cwd}")
+        nudge_dir = parts[5] if len(parts) > 5 and parts[5] != "NULL" else ""
+        print(f"{name:<15} {transport:<10} {groups:<20} {aliases:<20} {cwd:<25} {nudge_dir}")
 
 
 def _get_group_members(group_name):
@@ -723,31 +765,89 @@ def cmd_send(target, message, msg_type="note", payload=None, ref_type=None,
         print(f"Message sent to {recipients[0]}")
 
 
-def _nudge_recipients(recipients):
-    """Best-effort side-effect: drop a `.nudge-<agent>` flag file in
-    $RELAY_NUDGE_DIR for each recipient so a cmux-nudge-watcher can wake the
-    agent's pane. Controlled by two env vars (typically set in `.relay-env`):
+def _get_agent_nudge_dir(agent_name):
+    """Look up the nudge_dir registered for an agent. Returns the path string,
+    or None if not set or on any DB error."""
+    try:
+        rows = run_sql(
+            f"SELECT nudge_dir FROM relay_agents WHERE name = '{_esc(agent_name)}' LIMIT 1",
+            fetch=True,
+        )
+        if rows and rows[0].strip() and rows[0].strip() != "NULL":
+            return rows[0].strip()
+    except Exception:
+        pass
+    return None
 
+
+def _nudge_recipients(recipients):
+    """Best-effort side-effect: drop a `.nudge-<agent>` flag file so a
+    cmux-nudge-watcher can wake the agent's pane.
+
+    Per-agent nudge_dir (registered via `register --nudge-dir`):
+      If the agent has a nudge_dir in relay_agents, this function writes
+      <nudge_dir>/.nudge-<agent> directly. DB-registered nudge_dir is NOT
+      subject to the RELAY_NUDGE_AGENTS allowlist — any registered recipient
+      gets nudged at their own registered path.
+
+    Env-based fallback (legacy behaviour — unchanged):
       RELAY_NUDGE_DIR     — directory to write flag files into. Unset = disabled.
       RELAY_NUDGE_AGENTS  — comma-separated allowlist (e.g. "cody,carl,abby").
                             Unset = nudge all recipients.
 
-    Silent no-op if disabled, the dir doesn't exist, or the write fails —
-    this is a wake-up optimization, not part of the delivery guarantee.
+    Both paths are best-effort: a missing/unwritable directory logs a one-line
+    warning to stderr and continues — nudges are a wake-up optimisation, not
+    part of the delivery guarantee.
     """
-    nudge_dir = os.environ.get("RELAY_NUDGE_DIR")
-    if not nudge_dir:
-        return
+    env_nudge_dir = os.environ.get("RELAY_NUDGE_DIR")
     allow = os.environ.get("RELAY_NUDGE_AGENTS", "").strip()
     allowlist = {a.strip() for a in allow.split(",") if a.strip()} if allow else None
+
     for r in recipients:
-        if allowlist is not None and r not in allowlist:
-            continue
-        try:
-            with open(os.path.join(nudge_dir, f".nudge-{r}"), "w") as f:
-                f.write("check inbox\n")
-        except OSError:
-            pass
+        db_dir = _get_agent_nudge_dir(r)
+        if db_dir:
+            # DB-registered path — not subject to env allowlist.
+            try:
+                with open(os.path.join(db_dir, f".nudge-{r}"), "w") as f:
+                    f.write("check inbox\n")
+            except OSError as exc:
+                print(f"nudge: warning: could not write flag for {r!r} in {db_dir!r}: {exc}",
+                      file=sys.stderr)
+        elif env_nudge_dir:
+            # Env-based fallback — subject to RELAY_NUDGE_AGENTS allowlist.
+            if allowlist is not None and r not in allowlist:
+                continue
+            try:
+                with open(os.path.join(env_nudge_dir, f".nudge-{r}"), "w") as f:
+                    f.write("check inbox\n")
+            except OSError:
+                pass
+
+
+def cmd_nudge(agent, message="check inbox"):
+    """Write a nudge flag file for an agent using their registered nudge_dir.
+
+    Looks up the agent's nudge_dir in relay_agents. If not set, exits nonzero
+    with an actionable error. If the directory doesn't exist or isn't writable,
+    exits nonzero with a clear error.
+    """
+    ensure_schema()
+    nudge_dir = _get_agent_nudge_dir(agent)
+    if not nudge_dir:
+        print(
+            f"no nudge_dir registered for {agent!r} — re-register with --nudge-dir, "
+            "or the agent may live on another host",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    flag_path = os.path.join(nudge_dir, f".nudge-{agent}")
+    try:
+        with open(flag_path, "w") as f:
+            f.write(f"{message}\n")
+    except OSError as exc:
+        print(f"nudge: error: could not write {flag_path!r}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Nudged {agent}: {flag_path}")
 
 
 def _render_typed_body(msg_type, payload_str, ref_type, ref_id, thread_id):
@@ -903,13 +1003,18 @@ def main():
 
     elif cmd == "register":
         if len(sys.argv) < 3:
-            print("Usage: relay-msg register <name> [--group <g>] [--cwd <pattern>] [--transport local|remote] [--alias <name>]", file=sys.stderr)
+            print(
+                "Usage: relay-msg register <name> [--group <g>] [--cwd <pattern>] "
+                "[--transport local|remote] [--alias <name>] [--nudge-dir <path>]",
+                file=sys.stderr,
+            )
             sys.exit(1)
         name = sys.argv[2]
         groups = []
         aliases = []
         cwd_pattern = None
         transport = "local"
+        nudge_dir = None
         i = 3
         while i < len(sys.argv):
             if sys.argv[i] == "--group" and i + 1 < len(sys.argv):
@@ -924,9 +1029,13 @@ def main():
             elif sys.argv[i] == "--alias" and i + 1 < len(sys.argv):
                 aliases.append(sys.argv[i + 1])
                 i += 2
+            elif sys.argv[i] == "--nudge-dir" and i + 1 < len(sys.argv):
+                nudge_dir = sys.argv[i + 1]
+                i += 2
             else:
                 i += 1
-        cmd_register(name, groups=groups, cwd_pattern=cwd_pattern, transport=transport, aliases=aliases)
+        cmd_register(name, groups=groups, cwd_pattern=cwd_pattern, transport=transport,
+                     aliases=aliases, nudge_dir=nudge_dir)
 
     elif cmd == "unregister":
         if len(sys.argv) < 3:
@@ -936,6 +1045,21 @@ def main():
 
     elif cmd == "list":
         cmd_list()
+
+    elif cmd == "nudge":
+        if len(sys.argv) < 3 or sys.argv[2] in ("--help", "-h"):
+            print(
+                "Usage: relay-msg nudge <agent> [message]\n"
+                "\n"
+                "Write a .nudge-<agent> flag file to the agent's registered nudge_dir.\n"
+                "The file content is the optional message (default: 'check inbox').\n"
+                "The agent must have been registered with --nudge-dir <path>.\n"
+                "If nudge_dir is not set, exits nonzero with an actionable error.",
+            )
+            sys.exit(0 if sys.argv[2:3] in (["-h"], ["--help"]) else 1)
+        agent = sys.argv[2]
+        message = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "check inbox"
+        cmd_nudge(agent, message)
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

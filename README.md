@@ -63,6 +63,7 @@ python3 lib/relay/relay-msg register alice \
 | `--cwd <pattern>` | Substring matched against working directory for auto-detection |
 | `--transport local\|remote` | `local` = direct MySQL, `remote` = proxied (see below) |
 | `--alias <name>` | Alternate name this agent also receives messages for (repeatable) |
+| `--nudge-dir <path>` | Directory where this agent's `.nudge-<name>` flag file is written when nudged |
 
 ### 4. Send and receive
 
@@ -137,7 +138,8 @@ if result.stdout.strip():
 | `relay-msg check --history` | Show all messages including read |
 | `relay-msg register <name> [opts]` | Register or update an agent |
 | `relay-msg unregister <name>` | Remove an agent |
-| `relay-msg list` | List all agents, groups, and aliases |
+| `relay-msg list` | List all agents, groups, aliases, and nudge dirs |
+| `relay-msg nudge <agent> [message]` | Write a nudge flag file to the agent's registered nudge_dir |
 
 ## Identity Detection
 
@@ -163,20 +165,46 @@ The proxy command receives the full `mysql -u ... -e '...'` invocation. If it co
 
 An agent waiting for a message has no way to know one arrived until something wakes its session (a user prompt, a scheduled poll). For faster turn-around, `relay-msg send` can drop a **flag file** as a post-INSERT side-effect, and a separate watcher process picks up the flag and wakes the receiver's terminal pane.
 
-**Enable** by setting two env vars in `.relay-env`:
+### Per-agent nudge registry (recommended)
+
+Register each agent with the path to its own project directory:
+
+```bash
+python3 relay-msg register alice \
+  --cwd /workspace/alice \
+  --nudge-dir /workspace/alice \
+  --transport local
+```
+
+When any agent sends to `alice`, relay looks up `alice`'s `nudge_dir` and writes `/workspace/alice/.nudge-alice`. This solves cross-project nudging: each agent's watcher polls its own project directory, not a shared global path.
+
+You can also write a flag directly without sending a message:
+
+```bash
+python3 relay-msg nudge alice
+python3 relay-msg nudge alice "review PR #42"
+```
+
+`nudge` exits nonzero if the agent has no `nudge_dir` registered, or if the directory is missing/unwritable.
+
+**Note:** DB-registered `nudge_dir` values are **not** subject to the `RELAY_NUDGE_AGENTS` allowlist — any registered recipient always gets nudged at their own path.
+
+### Env-based fallback (legacy)
+
+For setups where all agents share one directory, set two env vars in `.relay-env`:
 
 ```
 RELAY_NUDGE_DIR=/path/to/shared/nudge-dir
 RELAY_NUDGE_AGENTS=alice,bob,carol     # allowlist; unset = nudge everyone
 ```
 
-When `alice` sends to `bob`, relay writes `/path/to/shared/nudge-dir/.nudge-bob` with the content `check inbox\n`. If `RELAY_NUDGE_DIR` is unset, the side-effect is skipped — no behavior change from the default.
+This path is used only for recipients that have no `nudge_dir` in the DB. If `RELAY_NUDGE_DIR` is unset and the agent has no DB `nudge_dir`, nudging is skipped — no behavior change from the default.
 
 **Flag-file contract** (for writing your own watcher):
-- Filename: `.nudge-<agent-name>` in `$RELAY_NUDGE_DIR`.
+- Filename: `.nudge-<agent-name>` in the agent's nudge dir.
 - Contents: a single line of text (default: `check inbox`). Your watcher sends this text to the agent's pane.
 - Watcher is expected to `rm -f` the flag after consuming.
-- Best-effort: `relay-msg` silently swallows `OSError` on write. Nudges are a wake-up optimization, not part of the delivery guarantee.
+- Best-effort: `relay-msg` logs a one-line warning to stderr on write failure and continues. Nudges are a wake-up optimization, not part of the delivery guarantee.
 
 **Reference watchers** in `watchers/`:
 - `cmux-nudge-watcher` — injects keystrokes to [cmux](https://github.com/anthropics/cmux) panes (only example; ships as template).
@@ -208,7 +236,7 @@ Four tables, auto-created on first use:
 
 | Table | Purpose |
 |-------|---------|
-| `relay_agents` | Registered agents (name, transport, cwd_pattern) |
+| `relay_agents` | Registered agents (name, transport, cwd_pattern, nudge_dir) |
 | `relay_agent_groups` | Agent-to-group memberships |
 | `relay_agent_aliases` | Alternate names an agent responds to |
 | `relay_messages` | Message queue with read tracking |
