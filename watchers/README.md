@@ -6,7 +6,7 @@ a starting point.
 
 | Watcher | Wakes | When to use |
 |---------|-------|-------------|
-| `relay-nudge-watcher` | cmux workspace **or** tmux session (auto-detected) | **Multi-machine setups.** Run ONE instance per machine; it derives the local agent set from the relay DB and ignores flags for agents on other machines. |
+| `relay-nudge-watcher` | cmux workspace **or** tmux session (auto-detected) | **Multi-machine setups.** Run ONE instance per machine: `relay-nudge-watcher <dir>`. The handled-agent set is discovered live from the local cmux/tmux sessions; flags for agents on other machines are left alone. |
 | `cmux-nudge-watcher` | a cmux workspace (via `cmux send` / `cmux send-key`) | Single-machine setups where all agents run inside cmux. Dynamic workspace discovery — no hardcoded agent names. |
 | `tmux-nudge-watcher` | a tmux window/pane (via `tmux send-keys`) | Single-machine setups where each agent has its own tmux session. |
 | `notify-nudge-watcher` | a macOS or Linux desktop notification | Your agent runs in a GUI app (e.g. Claude Desktop) with no terminal to type into. |
@@ -22,60 +22,59 @@ across multiple machines (laptops, VMs, CI hosts, Mac Minis, etc.).
   mount, or each machine's own `RELAY_NUDGE_DIR`).
 - Each machine runs its own `relay-nudge-watcher` pointing at that directory.
 - When a `.nudge-<agent>` flag appears, the watcher checks whether `<agent>`
-  belongs to **this machine**:
-  - **Handled** — wake the session and remove the flag.
-  - **Not handled** — leave the flag in place for the other machine's watcher.
+  has a **live session on this machine**:
+  - **Yes** — wake the session and remove the flag.
+  - **No** — leave the flag in place for the other machine's watcher.
 
 ### Handled-agent set
 
-Two ways to specify which agents this machine owns:
+The handled set is discovered **live from the terminal multiplexer** and
+re-checked every poll — a machine handles exactly the agents it currently has
+sessions open for. There is nothing to configure: open an agent's cmux
+workspace (or tmux session) and that agent is handled; close it and its flags
+are left for whichever machine does host it.
 
-**1. Automatic (recommended):** leave `--agents` unset. The watcher queries
-the relay DB for agents whose `cwd_pattern` resolves to an existing path on
-the local filesystem.
+- **cmux** (preferred): workspace titles from `cmux tree --all --json`.
+- **tmux** (when cmux is absent): session names from `tmux list-sessions`.
 
-```bash
-# Register alice with her workspace path as cwd_pattern + nudge_dir
-python3 relay-msg register alice \
-  --cwd /home/alice/project \
-  --nudge-dir /home/alice/project \
-  --transport local
-```
+Matching is case-insensitive — `.nudge-PHD` wakes a workspace titled `PHD`.
 
-When `relay-nudge-watcher` starts on a machine where `/home/alice/project`
-exists, it automatically includes `alice` in its handled set.
-
-**2. Explicit:** pass `--agents a,b,c`.
+**Override (optional):** pass `--agents a,b,c` to pin a static set instead —
+useful on a machine whose multiplexer this script can't introspect.
 
 ```bash
-./watchers/relay-nudge-watcher --dir /shared/nudges --agents alice,bob
+./watchers/relay-nudge-watcher /shared/nudges --agents alice,bob
 ```
 
 ### Configuration
 
 ```
 # .relay-env (in the relay directory or project root)
-RELAY_NUDGE_DIR=/home/alice/project   # default watch dir for --dir
-RELAY_DB_DRIVER=sqlite                # or mysql
-RELAY_DB_PATH=~/.agent-relay.sqlite3  # sqlite only
+RELAY_NUDGE_DIR=/shared/nudges        # default watch dir when <dir> is omitted
 ```
 
 ### Running
 
 ```bash
+# Watch a directory — agents auto-discovered from local cmux/tmux sessions
+./watchers/relay-nudge-watcher /shared/nudges
+
+# Default the directory from RELAY_NUDGE_DIR in .relay-env
+./watchers/relay-nudge-watcher
+
 # Long-running in its own tmux pane
-tmux new-window -n NudgeWatcher './watchers/relay-nudge-watcher'
+tmux new-window -n NudgeWatcher './watchers/relay-nudge-watcher /shared/nudges'
 
 # Or under launchd (macOS) — restart automatically on exit
-# com.example.relay-nudge-watcher.plist → ProgramArguments pointing here
+# com.example.relay-nudge-watcher.plist → ProgramArguments pointing here.
+# launchd has a minimal PATH: set EnvironmentVariables→PATH to include the
+# directory holding the `cmux` (or `tmux`) binary, or wake calls will no-op.
 
 # One-shot / cron mode (processes existing flags and exits)
-./watchers/relay-nudge-watcher --once
+./watchers/relay-nudge-watcher /shared/nudges --once
 
-# Explicit options
-./watchers/relay-nudge-watcher \
-  --dir /shared/nudge-flags \
-  --agents alice,bob \
+# Tuning
+./watchers/relay-nudge-watcher /shared/nudge-flags \
   --interval 5 \
   --log /var/log/relay-nudge.log
 ```
@@ -85,8 +84,8 @@ tmux new-window -n NudgeWatcher './watchers/relay-nudge-watcher'
 `relay-nudge-watcher` tries wake backends in order:
 
 1. **cmux** (if `cmux` is on PATH) — discovers all workspaces via
-   `cmux tree --all`, matches agent name case-insensitively to workspace
-   titles, then injects:
+   `cmux tree --all --json` (falling back to text parsing on older builds),
+   matches agent name case-insensitively to workspace titles, then injects:
    ```
    cmux send --workspace <ws> <message>
    cmux send-key --workspace <ws> enter
