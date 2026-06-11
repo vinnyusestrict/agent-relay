@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+relay-nudge-watcher — single, generalized nudge watcher for the Agent Relay.
+
+Run ONE instance of this script per machine. It watches a shared directory
+for .nudge-<agent> flag files, handles only the agents that belong to THIS
+machine (skipping flags meant for other machines), and wakes each handled
+agent's session by injecting the flag's contents as keystrokes.
+
+Wake mechanism:
+  1. cmux  — preferred when `cmux` is on PATH:
+               cmux send --workspace <ws> <message>
+               cmux send-key --workspace <ws> enter
+  2. tmux  — fallback when `tmux` is on PATH:
+               tmux send-keys -t <target> C-u <message> Enter
+
+  Target resolution:
+    - cmux: discovers all workspaces via `cmux tree --all`; matches agent name
+            case-insensitively to workspace title.  Re-discovers on miss.
+    - tmux: checks TMUX_TARGET_<AGENT_UPPER> env var first, then falls back
+            to a tmux session named exactly (case-insensitively) <agent>.
+
+  If no session is found, the nudge is logged as a WARNING but the flag is
+  still removed (the message was already delivered via the relay DB).
+
+Usage:
+  ./relay-nudge-watcher [options]
+
+Options:
+  --dir <path>       Directory to watch for .nudge-* flag files.
+                     Default: RELAY_NUDGE_DIR from .relay-env / env.
+  --agents a,b,c     Comma-separated list of agent names this machine handles.
+                     Default: derived from relay DB — agents whose cwd_pattern
+                     matches a directory that exists on this machine.
+  --interval <n>     Poll interval in seconds (default: 3).
+  --once             Process existing flags and exit (useful for testing/cron).
+  --log <path>       Append log lines to a file in addition to stdout.
+                     Default: /tmp/relay-nudge-watcher.log.
+
+Configuration:
+  The script reads .relay-env from its own directory (or two levels up),
+  exactly as relay-msg does.  All relay DB variables are honoured:
+    RELAY_DB_DRIVER, RELAY_DB_USER, RELAY_DB_PASS, RELAY_DB_NAME,
+    RELAY_DB_PATH, RELAY_TRANSPORT, RELAY_PROXY_CMD.
+  RELAY_NUDGE_DIR provides the default watch directory.
+
+Flag-file contract (unchanged from relay-msg):
+  Filename  : .nudge-<agent-name>
+  Contents  : single line of text to inject (default: "check inbox")
+  After use : watcher removes the file with os.unlink()
+
+Backwards compatibility:
+  Existing per-project watchers (cmux-nudge-watcher, tmux-nudge-watcher, etc.)
+  continue to work unchanged.  This script is an additional entry point —
+  nothing in relay-msg is modified.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ── .relay-env loader (mirrors relay-msg exactly) ────────────────────────────
+
+def _load_env_file():
+    """Load .relay-env from the script directory or two levels up.
+    Does NOT override values already set in the environment."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".relay-env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".relay-env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".relay-env"),
+    ]
+    for path in candidates:
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip()
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                            value = value[1:-1]
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+            break
+
+
+_load_env_file()
+
+# ── DB helpers (minimal — only what we need to query relay_agents) ────────────
+
+def _db_driver():
+    return os.environ.get("RELAY_DB_DRIVER", "mysql").strip().lower()
+
+
+def _sqlite_cmd(sql):
+    path = os.path.expanduser(os.environ.get("RELAY_DB_PATH", "~/.agent-relay.sqlite3"))
+    return ["sqlite3", "-batch", "-noheader", "-separator", "\t",
+            "-nullvalue", "NULL", path, sql]
+
+
+def _mysql_local_cmd(sql):
+    user = os.environ.get("RELAY_DB_USER", "root")
+    passwd = os.environ.get("RELAY_DB_PASS", "root")
+    dbname = os.environ.get("RELAY_DB_NAME", "agent_relay")
+    return ["mysql", "-u", user, f"-p{passwd}",
+            "--default-character-set=utf8mb4", "-N", "-B", dbname, "-e", sql]
+
+
+def _run_sql(sql):
+    """Run a SELECT query, return list of tab-separated row strings.
+    Returns empty list on any error (DB unreachable, table missing, etc.)."""
+    try:
+        if _db_driver() == "sqlite":
+            result = subprocess.run(_sqlite_cmd(sql), capture_output=True, text=True, timeout=10)
+        else:
+            transport = os.environ.get("RELAY_TRANSPORT", "local")
+            if transport == "remote":
+                proxy = os.environ.get("RELAY_PROXY_CMD", "")
+                if not proxy:
+                    return []
+                user = os.environ.get("RELAY_DB_USER", "root")
+                passwd = os.environ.get("RELAY_DB_PASS", "root")
+                dbname = os.environ.get("RELAY_DB_NAME", "agent_relay")
+                safe = sql.replace("'", "'\\''")
+                mysql_cmd = (f"mysql -u {user} -p{passwd} --default-character-set=utf8mb4 "
+                             f"-N -B {dbname} -e '{safe}'")
+                full = proxy.replace("{}", mysql_cmd) if "{}" in proxy else f"{proxy} {mysql_cmd}"
+                result = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=20)
+            else:
+                result = subprocess.run(_mysql_local_cmd(sql), capture_output=True,
+                                        text=True, timeout=10)
+        if result.returncode != 0:
+            return []
+        return [r for r in result.stdout.strip().splitlines() if r]
+    except Exception:
+        return []
+
+
+def _fetch_local_agents():
+    """Query relay_agents and return names whose cwd_pattern matches a
+    directory that actually exists on this machine.
+
+    A cwd_pattern is a substring — if it appears in any existing directory
+    path, the agent is considered local.  We test the pattern itself as a
+    path first (common case: patterns ARE the full directory path), then fall
+    back to checking whether the pattern matches against any standard mount
+    point or home directory.  The simplest and most reliable approach: treat
+    the cwd_pattern as a path candidate and check os.path.exists().
+    """
+    rows = _run_sql(
+        "SELECT name, cwd_pattern FROM relay_agents "
+        "WHERE cwd_pattern IS NOT NULL AND cwd_pattern != '' AND cwd_pattern != 'NULL'"
+    )
+    local = []
+    for row in rows:
+        parts = row.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        name, pattern = parts[0].strip(), parts[1].strip()
+        if not name or not pattern or pattern == "NULL":
+            continue
+        # Accept the agent if the pattern itself is an existing path, OR
+        # if it is a substring of an existing well-known base directory.
+        if os.path.exists(pattern):
+            local.append(name)
+        elif os.path.exists(os.path.expanduser(pattern)):
+            local.append(name)
+    return local
+
+# ── Session wake mechanism ────────────────────────────────────────────────────
+
+def _has_cmd(name):
+    return subprocess.run(["which", name], capture_output=True).returncode == 0
+
+
+# cmux workspace map: "lowercased-title" -> "workspace:N"
+_cmux_map = {}
+
+
+def _discover_cmux():
+    global _cmux_map
+    _cmux_map = {}
+    try:
+        r = subprocess.run(["cmux", "tree", "--all"], capture_output=True, text=True, timeout=5)
+        import re
+        for m in re.finditer(r'workspace (workspace:\d+) "([^"]+)"', r.stdout):
+            ref, title = m.group(1), m.group(2)
+            _cmux_map[title.strip().lower()] = ref
+    except Exception:
+        pass
+
+
+def _wake_cmux(agent, message):
+    """Inject keystrokes via cmux.  Returns True on success, False on no session."""
+    key = agent.lower()
+    ws = _cmux_map.get(key)
+    if not ws:
+        _discover_cmux()
+        ws = _cmux_map.get(key)
+    if not ws:
+        return False
+    try:
+        r1 = subprocess.run(["cmux", "send", "--workspace", ws, message],
+                             capture_output=True, timeout=5)
+        r2 = subprocess.run(["cmux", "send-key", "--workspace", ws, "enter"],
+                             capture_output=True, timeout=5)
+        return r1.returncode == 0 and r2.returncode == 0
+    except Exception:
+        return False
+
+
+def _wake_tmux(agent, message):
+    """Inject keystrokes via tmux.  Returns True on success, False on no session."""
+    upper = agent.upper()
+    override_var = f"TMUX_TARGET_{upper}"
+    target = os.environ.get(override_var, "")
+    if not target:
+        try:
+            r = subprocess.run(["tmux", "list-sessions", "-F", "#S"],
+                                capture_output=True, text=True, timeout=5)
+            for s in r.stdout.strip().splitlines():
+                if s.strip().lower() == agent.lower():
+                    target = s.strip()
+                    break
+        except Exception:
+            pass
+    if not target:
+        return False
+    try:
+        r = subprocess.run(["tmux", "send-keys", "-t", target, "C-u", message, "Enter"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _wake_agent(agent, message, logger):
+    """Try cmux first, then tmux.  Log result."""
+    if _has_cmd("cmux"):
+        if _wake_cmux(agent, message):
+            logger(f"woke {agent!r} via cmux: {message!r}")
+            return
+        logger(f"WARN: cmux found but no workspace for {agent!r}")
+    if _has_cmd("tmux"):
+        if _wake_tmux(agent, message):
+            logger(f"woke {agent!r} via tmux: {message!r}")
+            return
+        logger(f"WARN: tmux found but no session for {agent!r}")
+    if not _has_cmd("cmux") and not _has_cmd("tmux"):
+        logger(f"WARN: neither cmux nor tmux available — cannot wake {agent!r}")
+    else:
+        logger(f"WARN: no session found for {agent!r} — message was delivered to relay DB")
+
+# ── Debounce helper ───────────────────────────────────────────────────────────
+
+def _stable_mtime(path, debounce_secs=2, max_wait=30):
+    """Wait until the file's mtime is stable for debounce_secs.
+    Returns False if the file disappears during the wait."""
+    waited = 0
+    while True:
+        try:
+            mtime1 = os.stat(path).st_mtime
+        except OSError:
+            return False
+        time.sleep(debounce_secs)
+        try:
+            mtime2 = os.stat(path).st_mtime
+        except OSError:
+            return False
+        if mtime1 == mtime2:
+            return True
+        waited += debounce_secs
+        if waited >= max_wait:
+            return True  # force through after max_wait
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="relay-nudge-watcher",
+        description="Single generalized nudge watcher for the Agent Relay.",
+    )
+    parser.add_argument("--dir", default=None,
+                        help="Directory to watch (default: RELAY_NUDGE_DIR env var)")
+    parser.add_argument("--agents", default=None,
+                        help="Comma-separated agents this machine handles "
+                             "(default: derived from relay DB cwd_patterns)")
+    parser.add_argument("--interval", type=float, default=3.0,
+                        help="Poll interval in seconds (default: 3)")
+    parser.add_argument("--once", action="store_true",
+                        help="Process existing flags and exit (for testing/cron)")
+    parser.add_argument("--log", default="/tmp/relay-nudge-watcher.log",
+                        help="Append log output to this file (default: /tmp/relay-nudge-watcher.log)")
+    args = parser.parse_args()
+
+    watch_dir = args.dir or os.environ.get("RELAY_NUDGE_DIR", "")
+    if not watch_dir:
+        print("relay-nudge-watcher: error: no watch directory. "
+              "Use --dir or set RELAY_NUDGE_DIR in .relay-env.", file=sys.stderr)
+        sys.exit(1)
+    watch_dir = os.path.expanduser(watch_dir)
+
+    log_path = args.log
+    log_file = None
+    try:
+        log_file = open(log_path, "a")
+    except OSError as e:
+        print(f"relay-nudge-watcher: warning: cannot open log file {log_path!r}: {e}",
+              file=sys.stderr)
+
+    def log(msg):
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [relay-nudge-watcher] {msg}"
+        print(line)
+        if log_file:
+            print(line, file=log_file, flush=True)
+
+    # Resolve handled set.
+    if args.agents:
+        handled = {a.strip() for a in args.agents.split(",") if a.strip()}
+        log(f"handled agents (from --agents): {sorted(handled)}")
+    else:
+        handled = set(_fetch_local_agents())
+        if handled:
+            log(f"handled agents (from relay DB cwd_patterns): {sorted(handled)}")
+        else:
+            log("WARNING: no agents derived from relay DB — either no agents are "
+                "registered with --cwd patterns that exist locally, or the DB is "
+                "unreachable.  Pass --agents a,b,c to set the handled set explicitly.")
+
+    log(f"watching {watch_dir!r} (interval={args.interval}s, once={args.once})")
+
+    # Pre-discover cmux workspaces once at startup.
+    if _has_cmd("cmux"):
+        _discover_cmux()
+        log(f"cmux workspaces discovered: {sorted(_cmux_map.keys()) or '(none)'}")
+
+    def process_flags():
+        try:
+            entries = os.listdir(watch_dir)
+        except OSError as e:
+            log(f"ERROR: cannot list {watch_dir!r}: {e}")
+            return
+
+        for name in entries:
+            if not name.startswith(".nudge-"):
+                continue
+            agent = name[len(".nudge-"):]
+            flag_path = os.path.join(watch_dir, name)
+
+            if agent not in handled:
+                # Leave it for another machine's watcher.
+                continue
+
+            # Debounce — wait for the file to stop changing.
+            if not _stable_mtime(flag_path):
+                continue  # file vanished during debounce
+
+            try:
+                with open(flag_path) as f:
+                    message = f.read().strip() or "check inbox"
+            except OSError:
+                continue  # vanished between exists-check and open
+
+            try:
+                os.unlink(flag_path)
+            except OSError:
+                pass  # already removed by a concurrent watcher — still wake
+
+            log(f"handling nudge: agent={agent!r} message={message!r}")
+            _wake_agent(agent, message, log)
+
+    if args.once:
+        process_flags()
+        if log_file:
+            log_file.close()
+        sys.exit(0)
+
+    while True:
+        process_flags()
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()
