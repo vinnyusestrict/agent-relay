@@ -35,7 +35,7 @@ Options for register:
 
 Options for nudge:
   <agent>              Name of the agent to nudge
-  [message]            Optional message text (default: "check inbox")
+  [message]            Optional message text (default: the relay-check reminder)
 
 Agents self-register into a relay_agents table. No hardcoded peers.
 Groups are derived from agent registrations — no hardcoded broadcast lists.
@@ -97,6 +97,11 @@ DB_USER = os.environ.get("RELAY_DB_USER", "root")
 DB_PASS = os.environ.get("RELAY_DB_PASS", "root")
 DB_NAME = os.environ.get("RELAY_DB_NAME", "agent_relay")
 DB_PATH = os.path.expanduser(os.environ.get("RELAY_DB_PATH", "~/.agent-relay.sqlite3"))
+
+# Default text injected into an agent's pane when nudged. Kept explicit and
+# self-documenting: a bare "check inbox" was being misread (e.g. as email) by
+# agents that also have a mail tool. This names the exact command to run.
+DEFAULT_NUDGE_MSG = "Relay message waiting — run: python3 lib/relay/relay-msg check (your relay inbox, not email)"
 
 _schema_checked = False
 
@@ -809,7 +814,7 @@ def _nudge_recipients(recipients):
             # DB-registered path — not subject to env allowlist.
             try:
                 with open(os.path.join(db_dir, f".nudge-{r}"), "w") as f:
-                    f.write("check inbox\n")
+                    f.write(f"{DEFAULT_NUDGE_MSG}\n")
             except OSError as exc:
                 print(f"nudge: warning: could not write flag for {r!r} in {db_dir!r}: {exc}",
                       file=sys.stderr)
@@ -819,12 +824,12 @@ def _nudge_recipients(recipients):
                 continue
             try:
                 with open(os.path.join(env_nudge_dir, f".nudge-{r}"), "w") as f:
-                    f.write("check inbox\n")
+                    f.write(f"{DEFAULT_NUDGE_MSG}\n")
             except OSError:
                 pass
 
 
-def cmd_nudge(agent, message="check inbox"):
+def cmd_nudge(agent, message=DEFAULT_NUDGE_MSG):
     """Write a nudge flag file for an agent using their registered nudge_dir.
 
     Looks up the agent's nudge_dir in relay_agents. If not set, exits nonzero
@@ -1052,13 +1057,13 @@ def main():
                 "Usage: relay-msg nudge <agent> [message]\n"
                 "\n"
                 "Write a .nudge-<agent> flag file to the agent's registered nudge_dir.\n"
-                "The file content is the optional message (default: 'check inbox').\n"
+                "The file content is the optional message (default: the relay-check reminder).\n"
                 "The agent must have been registered with --nudge-dir <path>.\n"
                 "If nudge_dir is not set, exits nonzero with an actionable error.",
             )
             sys.exit(0 if sys.argv[2:3] in (["-h"], ["--help"]) else 1)
         agent = sys.argv[2]
-        message = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "check inbox"
+        message = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else DEFAULT_NUDGE_MSG
         cmd_nudge(agent, message)
 
     else:
